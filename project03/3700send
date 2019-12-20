@@ -1,0 +1,148 @@
+#!/usr/bin/python -u
+#
+# Project 3 Starter Code
+#
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+
+MSG_SIZE = 1500
+DATA_SIZE = 1000
+TIMEOUT = 2
+SEQUENCE = 0
+
+# Bind to localhost and an ephemeral port
+IP_PORT = sys.argv[1]
+UDP_IP = IP_PORT[0:IP_PORT.find(":")]
+UDP_PORT = int(IP_PORT[IP_PORT.find(":")+1:])
+dest = (UDP_IP, UDP_PORT)
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+sock.settimeout(TIMEOUT)
+
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+# list to store stdin data into packets
+packets = []
+# initial timout for a packet
+packet_timeout = 0.5
+# index of the last packet acked in the packets
+index_of_last_packet_ACKed = 0
+# the sequence number of last sent or acked
+last_SEQUENCE_sent = 0
+last_SEQUENCE_ACKed = 0
+
+# initial round trip time, sliding windows sizes
+RTT_AVG = 0.5
+initial_sliding_window_size = 10
+current_sliding_window_size = initial_sliding_window_size
+# if the sender have send EOF yet
+send_EOF_yet = False
+
+# read all the data into the packets
+def read_into_packets():
+  global SEQUENCE
+  global packets
+  while True:
+    data = sys.stdin.read(DATA_SIZE)
+    if(len(data) > 0):
+      msg = {'sequence': SEQUENCE, 'data': data, 'ack': False, 'eof': False}
+      SEQUENCE += len(data)
+      packets.append(msg)
+    else:
+      msg = {'sequence': SEQUENCE, 'data': '', 'ack': False, 'eof': True}
+      packets.append(msg)
+      break
+def send_next_packet(index):
+  # insert a timestampwhich will be useful to adjust RTT when it is acked back, timeout is for the sender
+  packets[index]['timestamp'] = time.time() 
+  packets[index]['timeout'] = packet_timeout 
+  msg = json.dumps(packets[index]) 
+  # try and send the message
+  if sock.sendto(msg, dest) < len(msg):
+    log("[error] unable to fully send packet")
+    return False
+  else:
+    log("[send data] " + str(packets[index]["sequence"]) + " (" + str(len(packets[index]["data"])) + ")")
+    return True
+
+read_into_packets()
+while True:
+  # when current sliding windows size is 0, means we can't send out more
+  # packets until we recv ack from receiver, have to wait, so timeout
+  timeout = False
+  if current_sliding_window_size == 0:
+    ready = select.select([sock],[],[],packet_timeout)
+    if ready[0]:# ready for reading, means we got something from the receiver
+      timeout = False
+    else:
+      timeout = True
+  
+  while True:
+    ready = select.select([sock],[],[],0)
+    if ready[0]: # something ready for reading
+      (data, addr) = sock.recvfrom(MSG_SIZE)
+      try:
+        decoded = json.loads(data)
+        # log the ACK to STDERR
+        log("[recv ack] " + str(decoded['ack']))
+        # update RTT and packet_timeout
+        current_time = time.time()
+        sent_time = decoded['timestamp']
+        this_RTT = current_time - sent_time
+        RTT_AVG = RTT_AVG * 0.85 + this_RTT * 0.15
+        packet_timeout = 1.8 * RTT_AVG
+        # when receiver receives EOF, the EOF will plus 1 in the ack;
+        # if so, means EOF ack, we can exit now
+        if decoded['ack'] == packets[-1]['sequence'] + 1:
+          log("[completed]")
+          sys.exit(0)
+        # when sender got a new ack, it updates sliding window size and last sequence sent or acked
+        if decoded['ack'] > last_SEQUENCE_ACKed:
+          msg_acked = [p for p in packets if p['sequence'] == decoded['ack']][0]
+          index_in_packets = packets.index(msg_acked)
+          current_sliding_window_size += index_in_packets - index_of_last_packet_ACKed
+          index_of_last_packet_ACKed = index_in_packets
+          last_SEQUENCE_ACKed = decoded['ack']
+          last_SEQUENCE_sent = max(last_SEQUENCE_sent, last_SEQUENCE_ACKed)
+        # if it's a duplicate packet, last_SEQUENCE_sent won't be updated, so it will be sent again
+      except (ValueError, KeyError, TypeError) as e:
+        # received a corrupt packet
+        log("[recv corrupt packet]")
+        continue
+    else:
+      break
+  # if it timeout, we regard last packet sent as corrupt or dropped or not received yet by the receiver,
+  # reset last_SEQUENCE_sent as last_SEQUENCE_ACKed and roll back silding window size to inital
+  # if last packet was sending EOF, then we reset send_EOF_yet to False
+  if timeout:
+    last_SEQUENCE_sent = last_SEQUENCE_ACKed
+    current_sliding_window_size = initial_sliding_window_size
+    send_EOF_yet = False
+  if send_EOF_yet: # set sliding window size to 0 after sending EOF
+    current_sliding_window_size = 0
+  # send a packet if sliding window allowed.
+  if current_sliding_window_size > 0:
+    EOF = last_SEQUENCE_sent >= packets[-1]['sequence']
+    next_msg = None
+    if EOF:# if it's EOF packet 
+      next_msg = packets[-1]
+    else:
+      next_msg = [p for p in packets if p['sequence'] == last_SEQUENCE_sent][0]
+    index_of_next_msg = packets.index(next_msg)
+    # send EOF packet if it's not been sent
+    if EOF and (not send_EOF_yet):
+      if send_next_packet(index_of_next_msg):
+        last_SEQUENCE_sent = next_msg['sequence'] + 1
+        send_EOF_yet = True
+        current_sliding_window_size = 0
+    elif not EOF:# not EOF, send a normal packet
+      if send_next_packet(index_of_next_msg):
+        last_SEQUENCE_sent += len(next_msg['data'])
+        current_sliding_window_size -= 1

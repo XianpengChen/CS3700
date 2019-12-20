@@ -1,0 +1,256 @@
+#!/usr/bin/python -u
+
+# username: 001636267
+# password: R31KW2FB
+
+import argparse
+import sys
+import socket
+import json
+from HTMLParser import HTMLParser
+
+HOST_NAME = 'fring.ccs.neu.edu'
+PORT = 80
+flag_found = 0
+frontier = set()
+visited_URL = set()
+session_id = 'wait for data'
+CSRF_token = 'wait for data'
+DATA_SIZE = 4096
+
+
+# create a subclass and override the handler methods
+class MyHTMLParser(HTMLParser):
+    got_a_flag = False
+
+    def handle_starttag(self, tag, attrs):
+        global frontier
+        global visited_URL
+        # not interested in any other tag
+        if tag != 'a' and tag != 'h2':
+            return
+        # collect attributes
+        attributes = {}
+        for a in attrs:
+            attributes[a[0]] = a[1]
+        if tag == 'a':  # add qualified link to frontier
+            link = attributes.get('href')
+            if link.startswith('/fakebook') and link not in visited_URL:
+                frontier.add(link)
+        elif tag == 'h2' and attributes.get('class') == 'secret_flag':  # got a secret flag
+            self.got_a_flag = True
+
+    def handle_endtag(self, tag):
+        return  # do nothing
+
+    def handle_data(self, data):  # print and counting flags
+        global flag_found
+        if self.got_a_flag:
+            print(data.lstrip('FLAG: '))
+            flag_found += 1
+            self.got_a_flag = False
+            if flag_found == 5:
+                exit(0)
+
+
+# parse a HTTP response header into a dict
+def header_parser(header):
+    parsed_headers = {}
+    headers = header.split('\r\n')
+    parsed_headers['statusCode'] = headers[0].split(' ')[1]
+    parsed_headers['headers'] = {}
+    parsed_headers['cookies'] = {}
+    for a in headers[1:]:
+        header_and_value = a.split(': ')  # split into header name and value
+        if header_and_value[0] == 'Set-Cookie':  # set cookie
+            cookies = header_and_value[1].split('; ')
+            for c in cookies:
+                cookie_name = c.split('=')[0]
+                cookie_value = c.split('=')[1]
+                parsed_headers['cookies'][cookie_name] = cookie_value
+        else:
+            parsed_headers['headers'][header_and_value[0]] = header_and_value[1]
+    return parsed_headers
+
+
+# read all content via content-length
+def read_via_content_length(sock, response_dict, content_got):
+    total_content_length = int(response_dict['headers']['Content-Length'])
+    content_left_length = total_content_length - len(content_got)
+    temp = content_got
+    while content_left_length > 0:  # iterate to a whole total_content_length bytes of data
+        bytes_to_read = min(DATA_SIZE, content_left_length)
+        bytes_read = sock.recv(bytes_to_read)
+        temp += bytes_read
+        content_left_length -= len(bytes_read)
+    response_dict['HTML'] = temp
+    return response_dict
+
+
+# read the length and data out of the given chunk
+def read_len_and_data(chunk):
+    temp = chunk.lstrip()
+    lines = temp.split('\r\n')
+    length = int(lines[0], 16)  # chunk length is hexadecimal encoded
+    data = '\r\n'.join(lines[1:])  # collect the part after removing chunk length
+    return length, data
+
+
+# read html content via chunked encoding, return a dict containing both headers and HTML
+def read_via_chunked_encoding(sock, response_dict, content_got):
+    if content_got == '':
+        content_got = sock.recv(DATA_SIZE)
+    total_content = ''  # to store the whole html
+    data_length, data_body = read_len_and_data(content_got)  # split content_got into a chunk length and whatever left
+    content_of_this_chunk = ''
+    while True:
+        if data_length <= len(data_body):  # means this data_body contains more than one chunk, need to iterate
+            content_of_this_chunk += data_body[0:data_length]
+            data_body = data_body[data_length:]
+            total_content += content_of_this_chunk
+            content_of_this_chunk = ''
+            if data_body.lstrip() == '':  # ask more if all data in this data_body was read
+                data_body = sock.recv(DATA_SIZE)
+            data_length, data_body = read_len_and_data(data_body)  # get the next chunk length and whatever left
+            if data_length == 0:  # ending chunk
+                break
+        else:  # need to ask for more data to complete this chunk when chunk length is larger than data_body length
+            content_of_this_chunk += data_body
+            data_length -= len(data_body)
+            data_body = sock.recv(DATA_SIZE)
+    response_dict['HTML'] = total_content
+    return response_dict
+
+
+# receive response after making a HTTP request to the socket
+def receive_response(sock):
+    temp = sock.recv(DATA_SIZE)
+    data = temp.split('\r\n\r\n')
+    response_header = data[0]
+    headers_dict = header_parser(response_header)  # parse headers into dict
+    encoding = headers_dict['headers'].get('Transfer-Encoding')
+    content_got = ''  # to collect data after headers
+    for a in data[1:]:
+        content_got = content_got + a
+    if headers_dict['headers'].get('Content-Length'):  # retrieve all data via content-length
+        return read_via_content_length(sock, headers_dict, content_got)
+    elif encoding and encoding == 'chunked':  # retrieve all data by collecting all chunked pieces
+        return read_via_chunked_encoding(sock, headers_dict, content_got)
+    else:
+        print('unsupported encoding of headers!')
+        print(json.dumps(content_got))
+        exit(1)
+
+
+# login to fakebook using given username and password via a socket
+def login(username, password, sock):
+    global CSRF_token
+    global session_id
+
+    login_page_path = '/accounts/login/?next=/fakebook/'
+    login_page__request = ('GET {} HTTP/1.1\n'
+                           'Host: fring.ccs.neu.edu\n'
+                           'Connection: keep-alive\n\n').format(login_page_path)
+    # request login page
+    sock.sendall(login_page__request)
+    msg = receive_response(sock)
+    if msg['statusCode'] != '200':
+        print('problem occurs while accessing login page')
+        print(json.dumps(msg))
+        exit(1)
+    CSRF_token = msg['cookies']['csrftoken']
+    session_id = msg['cookies']['sessionid']
+    login_request = 'username=' + username + '&password=' + password + '&csrfmiddlewaretoken=' + CSRF_token \
+                    + '&next=%2Ffakebook%2F'
+    request_header = ('POST /accounts/login/ HTTP/1.1\n'
+                      'Host: fring.ccs.neu.edu\n'
+                      'Content-Type: application/x-www-form-urlencoded\n'
+                      'Content-Length: {0}\n'
+                      'Connection: keep-alive\n'
+                      'Cookie: csrftoken={1}; sessionid={2}\n\n'
+                      '{3}\n\n'
+                      ).format(str(len(login_request)), CSRF_token, session_id, login_request)
+    # post username and password
+    sock.sendall(request_header)
+    msg2 = receive_response(sock)
+    status = msg2['statusCode']
+    if status != '200' and status != '302':
+        print('problem occurs while logging')
+        print(json.dumps(msg2))
+        exit(1)
+    # print(status + ' logged in')
+    session_id = msg2['cookies']['sessionid']
+    frontier.add('/fakebook/')
+    return
+
+
+# format request headers with given path
+def format_request_headers(path):
+    global CSRF_token
+    global session_id
+    request_headers = ('GET {0} HTTP/1.1\n'
+                       'Host: fring.ccs.neu.edu\n'
+                       'Cookie: csrftoken={1}; sessionid={2}\n'
+                       'Connection: keep-alive\n\n').format(path, CSRF_token, session_id)
+    return request_headers
+
+
+def main():
+    global session_id
+    # take in command line argument: username password
+    parser = argparse.ArgumentParser(description='a web crawler for secret flags.')
+    parser.add_argument('username', help='your NEU id')
+    parser.add_argument('password', help='password given by email')
+    args = parser.parse_args(sys.argv[1:])
+    username = args.username
+    password = args.password
+
+    # create a socket and login
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5)
+    sock.connect((HOST_NAME, PORT))
+    login(username, password, sock)
+    # parser to parse HTMl content
+    parser = MyHTMLParser()
+
+    while frontier:  # as long as frontier is not empty
+        link_to_crawl = frontier.pop()
+        request_headers = format_request_headers(link_to_crawl)
+        sock.sendall(request_headers)
+        msg = receive_response(sock)
+        status = msg['statusCode']
+        # print(status)
+        if status == '200':
+            visited_URL.add(link_to_crawl)
+            parser.feed(msg['HTML'])
+            parser.reset()
+            if msg['cookies'].get('sessionid'):
+                session_id = msg['cookies']['sessionid']
+        elif status == '301' or status == '302':
+            frontier.add(msg['headers']['Location'])
+            visited_URL.add(link_to_crawl)
+        elif status == '403' or status == '404':
+            visited_URL.add(link_to_crawl)
+        elif status == '500':
+            frontier.add(link_to_crawl)
+        else:
+            print("received unexpected status code: " + status)
+            print("while accessing URL: " + link_to_crawl)
+            exit(1)
+        # if server closed connection, keep trying to connect again
+        if msg['headers']['Connection'] == 'close':
+            # print("closed by server")
+            while True:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                    sock.close()
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(5)
+                    sock.connect((HOST_NAME, PORT))
+                except:
+                    continue
+                break
+
+
+if __name__ == "__main__":
+    main()

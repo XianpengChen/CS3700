@@ -1,0 +1,134 @@
+#!/usr/bin/python -u
+#
+# Project 3 Starter Code
+#
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+
+MSG_SIZE = 1500
+TIMEOUT = 30
+
+# a dict to store packets from sender
+packets = {}
+# map a sequence number to the time that sequence was acked
+sequence_to_timeACKed = {}  
+# map a sequence number to the number of times that sequence was acked
+sequence_numOfACKed = {}
+# the last acked sequence number
+last_acked_sequence = 0
+# number of EOF acks to send in the end
+sent_ACKs_EOF = 8
+# max number of acks for a sequence in 'timeout' window specified by sender
+max_num_of_acks = 5
+# print out file
+def printOutFile(packets):
+    seq = 0
+    while True:
+        data = packets[seq]['data']
+        EOF = packets[seq]['eof']
+        if EOF:
+            log("[completed]")
+            sys.exit(0)
+        else:
+            sys.stdout.write(data)
+            seq += len(data)
+# send redundant EOF acks to sender, print out file and exit
+def send_EOF_ACKs(packets):
+  global sent_ACKs_EOF
+  for i in range(sent_ACKs_EOF):
+    ready = select.select([sock], [sock], [], 0.1)
+    if ready[0]:
+      sock.recvfrom(MSG_SIZE)
+      break
+    if ready[1]:
+      log("sending "+ str(i + 1)+" EOF ack")
+      if sock.sendto(msg, addr) < len(msg):
+        log("[error] unable to fully send packet")
+      time.sleep(0.1)
+  printOutFile(packets)
+  sys.exit(0)       
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+# Bind to localhost and an ephemeral port
+UDP_IP = "127.0.0.1"
+UDP_PORT = 0
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+sock.bind((UDP_IP, UDP_PORT))
+sock.settimeout(TIMEOUT)
+
+# Get port we bound to
+UDP_PORT = sock.getsockname()[1]
+log("[bound] " + str(UDP_PORT))
+
+# Now listen for packets
+while True:
+  # receive a packet
+  result = sock.recvfrom(MSG_SIZE)
+  # If nothing is ready, we hit the timeout
+  if result:
+    (data, addr) = result
+    try:
+      decoded = json.loads(data)
+      dec_seq = decoded['sequence']
+      dec_data = decoded['data']
+      # if there is no entry in the two dicts, add them
+      if not sequence_to_timeACKed.get(dec_seq):
+        sequence_to_timeACKed[dec_seq] = 0
+        sequence_numOfACKed[dec_seq] = 0
+      # If there is data, we accept it
+      if (dec_data or decoded['eof']):
+        # packet is new, not acked yet
+        if packets.get(dec_seq) is None:
+          packets[dec_seq] = decoded
+          # arrive in order
+          if dec_seq == 0 or dec_seq - len(dec_data) == last_acked_sequence:
+            log("[recv data] " + str(dec_seq) + " (" + str(len(dec_data)) + ") ACCEPTED (in-order)")
+          else: # arrive out of order
+            log("[recv data] " + str(dec_seq) + " (" + str(len(dec_data)) + ") ACCEPTED (out-of-order)")
+          last_acked_sequence = dec_seq
+        else: # ingore duplicate 
+          log("[recv data] " + str(dec_seq) + " (" + str(len(dec_data)) + ") IGNORED")
+      # find out which msg to ack
+      seq_iterator = 0
+      msg_to_ack = None
+      while True:
+        prev_msg = msg_to_ack
+        msg_to_ack = packets.get(seq_iterator)
+        if msg_to_ack is None:
+          # send ack for previous msg
+          msg_to_ack = prev_msg
+          break
+        else:# keep iterating if there is msg_to_ack
+          if msg_to_ack['eof']:
+            break
+          seq_iterator += len(msg_to_ack['data'])
+      curr_seq = msg_to_ack['sequence']
+      # check if timeout according to 'timeout' from sender
+      timed_out = time.time() - sequence_to_timeACKed[curr_seq] > decoded['timeout']
+      if timed_out:
+        # update sequence_to_timeACKed and reset sequence_numOfACKed if timeout
+        sequence_to_timeACKed[curr_seq] = time.time()
+        sequence_numOfACKed[curr_seq] = 0  
+      EOF = msg_to_ack['eof']
+      # send out ack if timeout or number of ACKs for the sequence number is less than max_num_of_acks
+      if timed_out or sequence_numOfACKed[curr_seq] < max_num_of_acks:
+        sequence_numOfACKed[curr_seq] += 1
+        # send out the ack msg
+        msg = json.dumps({'ack': curr_seq + len(msg_to_ack['data']) + EOF, 'timestamp':msg_to_ack['timestamp']})
+        if sock.sendto(msg, addr) < len(msg):
+          log("[error] unable to fully send packet")
+      # if receive EOF, send EOF acks and exit
+      if EOF:
+        send_EOF_ACKs(packets)
+    except (ValueError, KeyError, TypeError) as e:
+      log("[recv corrupt packet]")
+  else:
+    log("[error] timeout")
+    sys.exit(-1)

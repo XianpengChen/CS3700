@@ -1,0 +1,530 @@
+#!/usr/bin/env python
+
+import sys, socket, select, time, json, random
+
+# Your ID number
+my_id = sys.argv[1]
+
+# The ID numbers of all the other replicas
+replica_ids = sys.argv[2:]
+
+# number of servers in the group
+number_of_servers = 1 + len(replica_ids)
+
+# Connect to the network. All messages to/from other replicas and clients will
+# occur over this socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+sock.connect(my_id)
+
+
+# reset election timer
+def reset_election_timer():
+    return random.randrange(6, 9) * 0.1
+
+
+# randomized election timout for this replica,
+timeout = reset_election_timer()
+
+# a dictionary to store key-value pairs
+key_value_store = {}
+# latest term server has seen (initialized to 0 on first boot, increases monotonically)
+currentTerm = 0
+# candidateId that received vote in current term (or null if none), a term-id mapping
+votedFor = {}
+# log entries; each entry contains command for state machine, and term when entry was received by leader (first index
+# is 1)
+logs = [{'term': 0, 'content': 'initializing'}]
+# append one, so the actual first index would be 1
+# then start with index 1, like logs[1] = ....
+# Volatile state on all servers:
+# index of highest log entry known to be committed (initialized to 0, increases monotonically)
+commitIndex = 0
+# index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+lastApplied = 0
+# Volatile state on leaders: (Reinitialized after election)
+# for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+nextIndex = {}  # replica ID - index pair
+# for each server, index of highest log entry known to be replicated on server (initialized to 0, increases
+# monotonically)
+matchIndex = {}  # replica ID - index pair
+# who the leader is
+leader = 'FFFF'
+# last time received from the leader
+last_from_leader = time.time()
+# map a replica id to a timestamp, representing the last time rid receives from a leader
+last_to_RID = {}
+
+message_interval = 0.1
+
+SRC = 'src'
+DST = 'dst'
+TYPE = 'type'
+LEADER = 'leader'
+MID = 'MID'
+KEY = 'key'
+VALUE = 'value'
+OK = 'ok'
+FAIL = 'fail'
+REDIRECT = 'redirect'
+PUT = 'put'
+GET = 'get'
+APPEND = 'append'
+RES_TO_APPEND = 'response_to_append'
+VOTE_REQUEST = 'vote_request'
+RES_TO_VOTE = 'response_to_vote_request'
+FOLLOWER = 'follower'
+CANDIDATE = 'candidate'
+TERM = 'term'
+CLIENT = 'client'
+PRE_LOG_INDEX = 'prevLogIndex'
+PRE_LOG_TERM = 'prevLogTerm'
+LEADER_COMMIT = 'leaderCommit'
+ENTRIES = 'entries'
+SUCCESS = 'success'
+CONFIRMED = 'confirmed'
+TIMESTAMP = 'timestamp'
+VOTE_GRANTED = 'voteGranted'
+NEXT_INDEX = 'nextIndex'
+CANDIDATE_ID = 'candidateId'
+LAST_LOG_INDEX = 'lastLogIndex'
+LAST_LOG_TERM = 'lastLogTerm'
+# the state of this server(replica), either leader, candidate or follower
+server_state = FOLLOWER
+
+# it should formats like this {PUT: msg, MID: MID, confirmed: set(), timestamp: time}, a put request sent out replicas,
+# but not confirmed yet
+put_been_processing = {PUT: None, MID: None, CONFIRMED: set(), TIMESTAMP: time.time()}
+
+
+def initialize_put_bp():
+    global put_been_processing
+    put_been_processing = {PUT: None, MID: None, CONFIRMED: set(), TIMESTAMP: time.time()}
+
+
+# use this to collect votes(to determine If I am elected) after i become a candidate, reset to empty after I am
+# elected or i am converted to follower
+vote_on_term = set()
+
+# map replica id to vote request, (need to send the vote request to that replica)
+vote_requests_to_send = {}
+# queues are first in, first out
+# received message queue, put msg here and deal with them in order
+received_msg_queue = []
+# queue of responses that need to be sent to clients
+msg_to_clients_queue = []
+# queue of responses that need to be sent to other servers
+msg_to_replicas_queue = []
+
+
+# to become a follower given higher term, and new leader
+def become_a_follower(higher_term, new_leader):
+    global currentTerm, leader, server_state, last_from_leader, nextIndex, matchIndex, last_to_RID
+    global vote_on_term, vote_requests_to_send, put_been_processing
+    currentTerm = higher_term
+    leader = new_leader
+    last_from_leader = time.time()
+    if server_state == LEADER:
+        nextIndex = {}
+        matchIndex = {}
+        last_to_RID = {}
+        put = put_been_processing[PUT]
+        if put is not None:
+            push_to_client(put)
+        initialize_put_bp()
+    elif server_state == CANDIDATE:
+        vote_on_term = set()
+        vote_requests_to_send = {}
+    server_state = FOLLOWER
+    return
+
+
+# to become a candidate after election timeout
+def become_a_candidate():
+    global server_state, currentTerm, last_from_leader, timeout, vote_on_term, votedFor, vote_requests_to_send
+    global last_to_RID
+    last_from_leader = time.time()
+    server_state = CANDIDATE
+    currentTerm += 1
+    timeout = reset_election_timer()
+    vote_on_term.add(my_id)
+    votedFor[currentTerm] = my_id
+    for x in replica_ids:
+        last_to_RID[x] = 0
+        msg = {TERM: currentTerm, CANDIDATE_ID: my_id, LAST_LOG_INDEX: len(logs) - 1,
+               LAST_LOG_TERM: logs[-1][TERM]}
+        request_for_vote = format_message(x, VOTE_REQUEST, msg)
+        vote_requests_to_send[x] = request_for_vote
+
+
+# to become a leader after receiving majority votes
+def become_a_leader():
+    global server_state, leader, vote_requests_to_send, vote_on_term, last_to_RID, nextIndex, matchIndex
+    global msg_to_replicas_queue
+    server_state = LEADER
+    leader = my_id
+    vote_requests_to_send = {}
+    vote_on_term = set()
+    for x in replica_ids:
+        last_to_RID[x] = 0
+        matchIndex[x] = 0
+        nextIndex[x] = len(logs)
+
+
+# format an outgoing message with given information
+def format_message(dst, ty, msg):
+    msg[DST] = dst
+    msg[TYPE] = ty
+    msg[LEADER] = leader
+    msg[SRC] = my_id
+    return msg
+
+
+# store a message to msg_to_clients_queue ?
+def push_to_client(msg):
+    global msg_to_clients_queue
+    temp = {MID: msg[MID]}
+    temp = format_message(my_id, REDIRECT, temp)
+    msg_to_clients_queue.append(temp)
+
+
+# deal with put or get requests from clients as a leader
+def deal_with_get_put(msg):
+    global msg_to_clients_queue, logs
+    global put_been_processing
+    if msg[TYPE] == GET:
+        value = key_value_store.get(msg[KEY], '')
+        response = {VALUE: value, MID: msg[MID]}
+        response = format_message(msg[SRC], OK, response)
+        msg_to_clients_queue.append(response)
+    elif msg[TYPE] == PUT:
+        entry = {TERM: currentTerm, CLIENT: msg[SRC], MID: msg[MID], KEY: msg[KEY], VALUE: msg[VALUE]}
+        logs.append(entry)
+        for x in replica_ids:
+            last_to_RID[x] = 0
+        put_been_processing[PUT] = msg
+        put_been_processing[MID] = msg[MID]
+        put_been_processing[CONFIRMED].add(my_id)
+        put_been_processing[TIMESTAMP] = time.time()
+
+
+# given a RID, format a append RPC for it
+def format_append_rpc(rid):
+    global leader, put_been_processing
+    rpc_parameters = {TERM: currentTerm, LEADER: leader, PRE_LOG_INDEX: nextIndex[rid] - 1,
+                      PRE_LOG_TERM: logs[nextIndex[rid] - 1][TERM], LEADER_COMMIT: commitIndex}
+    entries_to_append = []
+    if nextIndex[rid] < len(logs):
+        entries_to_append = logs[nextIndex[rid]:]
+    if len(entries_to_append) > 100:
+        entries_to_append = entries_to_append[0:100]
+    elif put_been_processing[MID] is not None:
+        rpc_parameters[MID] = put_been_processing[MID]
+    rpc_parameters[ENTRIES] = entries_to_append
+    rpc_parameters = format_message(rid, APPEND, rpc_parameters)
+    return rpc_parameters
+
+
+# send a message via given socket
+def send_a_message(msg, given_sock):
+    given_sock.send(json.dumps(msg))
+    return
+
+
+# read all message on a ready sock into received_msg_queue
+def read_all_message(given_sock):
+    global received_msg_queue
+    while True:
+        ready = select.select([given_sock], [], [], 0.000001)
+        temp = None
+        if ready[0]:
+            temp = given_sock.recv(32768)
+            if len(temp) == 0:
+                temp = None
+            else:
+                temp = json.loads(temp)
+        if temp is None:
+            return
+        else:
+            received_msg_queue.append(temp)
+
+
+# to check if given log_index and log_term are more advanced than the last entry in logs
+def logs_updated(log_index, log_term):
+    global logs
+    last_term = logs[-1][TERM]
+    if log_term > last_term:
+        return True
+    elif log_term < last_term:
+        return False
+    else:
+        return log_index >= len(logs) - 1
+
+
+# push a response to msg_to_replicas_queue
+def push_to_replicas(msg, response):
+    global msg_to_replicas_queue
+    temp = response
+    if msg.get(MID):
+        temp[MID] = msg[MID]
+    temp = format_message(msg[SRC], RES_TO_APPEND, temp)
+    msg_to_replicas_queue.append(temp)
+
+
+# deal with received_msg_queue as a follower, different msgs types will have different handling
+def deal_with_msgs_as_follower():
+    global last_from_leader, msg_to_replicas_queue, leader, currentTerm, logs, commitIndex, lastApplied, key_value_store
+    global received_msg_queue, msg_to_clients_queue, votedFor
+    if len(received_msg_queue) == 0:
+        return
+    not_processed = []  # msgs not been processed
+    while len(received_msg_queue) > 0:
+        msg = received_msg_queue.pop(0)  # first in, first out
+        typ = msg[TYPE]
+
+        if typ == PUT or typ == GET:
+            if leader == 'FFFF':
+                not_processed.append(msg)
+            else:
+                response = {MID: msg[MID]}
+                response = format_message(msg[SRC], REDIRECT, response)
+                msg_to_clients_queue.append(response)
+
+        elif typ == APPEND:
+            last_from_leader = time.time()
+            if msg[TERM] < currentTerm or msg[PRE_LOG_INDEX] >= len(logs) or msg[PRE_LOG_TERM] != \
+                    logs[msg[PRE_LOG_INDEX]][TERM]:
+                response = {TERM: currentTerm, SUCCESS: False, NEXT_INDEX: commitIndex}
+                push_to_replicas(msg, response)
+            else:
+                currentTerm = msg[TERM]
+                leader = msg[LEADER]
+                if len(msg[ENTRIES]) > 0:
+                    logs = logs[0:msg[PRE_LOG_INDEX] + 1]
+                    for e in msg[ENTRIES]:
+                        logs.append(e)
+                if msg[LEADER_COMMIT] > commitIndex:
+                    commitIndex = min(msg[LEADER_COMMIT], len(logs) - 1)
+                    while commitIndex > lastApplied:
+                        lastApplied += 1
+                        key = logs[lastApplied][KEY]
+                        value = logs[lastApplied][VALUE]
+                        key_value_store[key] = value
+                response = {TERM: currentTerm, SUCCESS: True, NEXT_INDEX: len(logs)}
+                push_to_replicas(msg, response)
+
+        elif typ == VOTE_REQUEST:
+            vote = True
+            if msg[TERM] < currentTerm:
+                vote = False
+                response = {VOTE_GRANTED: vote, TERM: currentTerm}
+                response = format_message(msg[SRC], RES_TO_VOTE, response)
+                msg_to_replicas_queue.append(response)
+            else:
+                currentTerm = msg[TERM]
+                leader = 'FFFF'
+                candidate = msg[CANDIDATE_ID]
+                if logs_updated(msg[LAST_LOG_INDEX], msg[LAST_LOG_TERM]) and \
+                        votedFor.get(currentTerm, candidate) == candidate:
+                    votedFor[currentTerm] = candidate
+                else:
+                    vote = False
+                response = {VOTE_GRANTED: vote, TERM: currentTerm}
+                response = format_message(msg[SRC], RES_TO_VOTE, response)
+                msg_to_clients_queue.append(response)
+
+        elif typ == RES_TO_VOTE or typ == RES_TO_APPEND:
+            if currentTerm < msg[TERM]:
+                leader = msg[LEADER]
+                currentTerm = msg[TERM]
+
+    received_msg_queue = not_processed
+
+
+# adjust commit index as a leader
+def adjust_commit_index():
+    global commitIndex, matchIndex, logs, currentTerm, number_of_servers
+    for n in range(commitIndex + 1, len(logs)):
+        temp = 0
+        for x in replica_ids:
+            if matchIndex[x] >= n and logs[n][TERM] == currentTerm:
+                temp += 1
+        if temp > number_of_servers / 2.0:
+            commitIndex = n
+        else:
+            break
+
+
+# deal with received msgs as a leader,different msgs types will have different handling
+def deal_with_msgs_as_leader():
+    global nextIndex, received_msg_queue, commitIndex, matchIndex, put_been_processing, currentTerm
+    global lastApplied, msg_to_replicas_queue, key_value_store, last_to_RID, msg_to_clients_queue
+    if len(received_msg_queue) == 0:
+        return
+    not_processed = []
+    while len(received_msg_queue) > 0:
+        msg = received_msg_queue.pop(0)
+        typ = msg[TYPE]
+
+        if typ == PUT or typ == GET:
+            if put_been_processing[PUT] is not None:
+                not_processed.append(msg)
+            else:
+                deal_with_get_put(msg)
+
+        elif typ == APPEND:
+            if currentTerm < msg[TERM]:
+                received_msg_queue = not_processed + [msg] + received_msg_queue
+                become_a_follower(msg[TERM], msg[LEADER])
+                return deal_with_msgs_as_follower()
+            else:
+                response = {TERM: currentTerm, SUCCESS: False}
+                response = format_message(msg[SRC], RES_TO_APPEND, response)
+                msg_to_replicas_queue.append(response)
+
+        elif typ == RES_TO_APPEND:
+            last_to_RID[msg[SRC]] = time.time()
+            if currentTerm < msg[TERM]:
+                become_a_follower(msg[TERM], msg[LEADER])
+                received_msg_queue = not_processed + received_msg_queue
+                return deal_with_msgs_as_follower()
+            elif not msg[SUCCESS]:
+                nextIndex[msg[SRC]] = msg[NEXT_INDEX]
+            else:
+                index = min(msg[NEXT_INDEX], len(logs))
+                nextIndex[msg[SRC]] = index
+                matchIndex[msg[SRC]] = index - 1
+                if put_been_processing[MID] is not None:
+                    if msg.get(MID) == put_been_processing[MID]:
+                        put_been_processing[CONFIRMED].add(msg[SRC])
+                        if len(put_been_processing[CONFIRMED]) > (number_of_servers / 2.0):
+                            commitIndex = len(logs) - 1
+                            initialize_put_bp()
+            adjust_commit_index()
+            while lastApplied < commitIndex:
+                lastApplied += 1
+                entry = logs[lastApplied]
+                key_value_store[entry[KEY]] = entry[VALUE]
+                response = {MID: entry[MID]}
+                response = format_message(entry[CLIENT], OK, response)
+                msg_to_clients_queue.append(response)
+
+        elif typ == VOTE_REQUEST:
+            return res_to_voteRQ(msg, not_processed)
+        elif typ == RES_TO_VOTE:
+            if currentTerm < msg[TERM]:
+                become_a_follower(msg[TERM], msg[LEADER])
+                received_msg_queue = not_processed + received_msg_queue
+                return deal_with_msgs_as_follower()
+
+    received_msg_queue = not_processed
+
+
+# respond to vote request as a leader or candidate
+def res_to_voteRQ(msg, not_processed):
+    global received_msg_queue, msg_to_replicas_queue
+    if currentTerm < msg[TERM]:
+        become_a_follower(msg[TERM], msg[LEADER])
+        received_msg_queue = not_processed + [msg] + received_msg_queue
+        return deal_with_msgs_as_follower()
+    else:
+        response = {TERM: currentTerm, VOTE_GRANTED: False}
+        response = format_message(msg[SRC], RES_TO_VOTE, response)
+        msg_to_replicas_queue.append(response)
+        received_msg_queue = not_processed
+        return
+
+
+# deal with msgs as a candidate,different msgs types will have different handling
+def deal_with_msgs_as_candidate():
+    global currentTerm, received_msg_queue, msg_to_replicas_queue, received_msg_queue, vote_requests_to_send
+    global votedFor, number_of_servers, vote_on_term
+    if len(received_msg_queue) == 0:
+        return
+    not_processed = []
+    while len(received_msg_queue) > 0:
+        msg = received_msg_queue.pop(0)
+
+        typ = msg[TYPE]
+        if typ == PUT or typ == GET:
+            not_processed.append(msg)
+
+        elif typ == APPEND:
+            if currentTerm <= msg[TERM]:
+                become_a_follower(msg[TERM], msg[LEADER])
+                received_msg_queue = not_processed + [msg] + received_msg_queue
+                return deal_with_msgs_as_follower()
+            else:
+                response = {TERM: currentTerm, SUCCESS: False}
+                response = format_message(msg[SRC], RES_TO_APPEND, response)
+                msg_to_replicas_queue.append(response)
+
+        elif typ == RES_TO_APPEND:
+            if currentTerm <= msg[TERM]:
+                become_a_follower(msg[TERM], msg[LEADER])
+                received_msg_queue = not_processed + received_msg_queue
+                return deal_with_msgs_as_follower()
+
+        elif typ == VOTE_REQUEST:
+            return res_to_voteRQ(msg, not_processed)
+
+        elif typ == RES_TO_VOTE:
+            if currentTerm < msg[TERM]:
+                become_a_follower(msg[TERM], msg[LEADER])
+                received_msg_queue = not_processed + received_msg_queue
+                return deal_with_msgs_as_follower()
+            if msg[TERM] == currentTerm and msg[VOTE_GRANTED] == True:
+                vote_on_term.add(msg[SRC])
+                vote_requests_to_send.pop(msg[SRC])
+                if len(vote_on_term) > (number_of_servers / 2.0):
+                    become_a_leader()
+                    received_msg_queue = not_processed + received_msg_queue
+                    return deal_with_msgs_as_leader()
+    received_msg_queue = not_processed
+
+
+# processing all queue msgs
+def process_all():
+    if server_state == FOLLOWER:
+        deal_with_msgs_as_follower()
+    elif server_state == LEADER:
+        deal_with_msgs_as_leader()
+    else:
+        deal_with_msgs_as_candidate()
+
+
+# send out heartbeats as a candidate or leader
+def send_heartbeats(given_sock):
+    global last_to_RID
+    current_time = time.time()
+    if server_state == CANDIDATE:
+        for x in replica_ids:
+            if vote_requests_to_send.get(x) and current_time - last_to_RID[x] > message_interval:
+                send_a_message(vote_requests_to_send[x], given_sock)
+                last_to_RID[x] = current_time
+    elif server_state == LEADER:
+        for x in replica_ids:
+            if current_time - last_to_RID[x] > message_interval:
+                msg = format_append_rpc(x)
+                send_a_message(msg, given_sock)
+                last_to_RID[x] = current_time
+
+
+# sending out messages in queues
+def send_out_message(given_sock):
+    global msg_to_clients_queue, msg_to_replicas_queue
+    for msg in msg_to_clients_queue:
+        send_a_message(msg, given_sock)
+    msg_to_clients_queue = []
+    for msg in msg_to_replicas_queue:
+        send_a_message(msg, given_sock)
+    msg_to_replicas_queue = []
+
+
+while True:
+    send_out_message(sock)
+    send_heartbeats(sock)
+    read_all_message(sock)
+    process_all()
+    now = time.time()
+    if server_state != LEADER and (now - last_from_leader) > timeout:
+        become_a_candidate()
